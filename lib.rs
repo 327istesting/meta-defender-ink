@@ -5,10 +5,9 @@
 #[ink::contract]
 mod meta_defender {
 
-    use ink::prelude::{
-        vec::Vec,
-    };
+    use ink::prelude::vec::Vec;
 
+    // use ink::primitives::AccountId;
     use ink::storage::Mapping;
 
 
@@ -73,6 +72,23 @@ mod meta_defender {
         InsufficientCoverage,
         ExistingUnderWriter,
         NotUnderwriter,
+        NotValidUnderwriter,
+        ProviderLeavingInProgress,
+        NotHistoricalUnderwriter,
+        HistoricalProviderLeavingInProgress,
+        InsufficientSToken,
+        NotExistedPolicy,
+        AlreadyCancelledPolicy,
+        NotExpiredPolicy,
+        ClaimingInProgress,
+        OnlyPolicyHolderCanCancel,
+        PreviousPolicyNotCancelled,
+        NotBeneficiary,
+        AlreadyClaimedPolicy,
+        InClaimingProgress,
+        NotEffectivePolicy,
+        NotInClaimingProgress,
+        NotValidMiningProxy,
     }
 
 
@@ -276,7 +292,7 @@ mod meta_defender {
                 match self.user_policies.get(beneficiary) {
                     Some(mut v) => v.push(policy),
                     None => {
-                        self.user_policies.insert(&beneficiary, &vec![policy]);
+                        self.user_policies.insert(&beneficiary, &Vec::from([policy]));
                     }
                 }
 
@@ -335,10 +351,355 @@ mod meta_defender {
         }
 
 
-        pub fn get_reward(&self, address: AccountId) -> Result<()> {
-            if 
-            NotUnderwriter
-            Ok(())
+        pub fn get_reward(&self, address: &AccountId) -> u128 {
+            match self.provider_map.get(address){
+                None =>  0,
+                Some(v) => {
+                    if v.stoken_amount != 0 {
+                        v.stoken_amount * self.acc_rps / 10_000_000_000_000 - v.rdebt
+                    }else{
+                        0
+                    }
+                }
+            }
         }
+
+        pub fn provider_take_reward(&mut self) -> Result<()>{
+            let caller = self.env().caller();
+            match self.provider_map.get(caller) {
+                None => Err(Error::NotUnderwriter),
+                Some(v) if v.stoken_amount == 0 => Err(Error::NotValidUnderwriter),
+                Some(mut v) => {
+                    let reward = self.get_reward(&caller);
+                    v.rdebt = v.stoken_amount * self.acc_rps / 10_000_000_000_000;
+                    // aUSD.transfer(msg.sender, reward); //支付收益
+                    Ok(())
+                }
+            }
+        }
+
+        fn get_shadow(&self, provider: &ProviderInfo) -> u128{
+            if provider.index > self.latest_unfrozen_index{
+                provider.stoken_amount * self.acc_sps / 10_000_000_000_000 - provider.sdebt
+            }else{
+                let delta = self.acc_sps - self.acc_sps_down;
+                provider.stoken_amount * delta / 10_000_000_000_000
+            }
+
+        }
+
+        fn get_shadow_historical_provider(&self, historical_provider: &HistoricalProviderInfo) -> u128 {
+            if historical_provider.index_before > self.latest_unfrozen_index{
+                historical_provider.stoken_amount_before * historical_provider.acc_sps_while_left / 10_000_000_000_000 - historical_provider.sdebt_before
+            }else{
+                if historical_provider.acc_sps_while_left >= self.acc_sps_down {
+                    historical_provider.acc_sps_while_left - self.acc_sps_down
+                } else{
+                    let delta = historical_provider.acc_sps_while_left - self.acc_sps_down;
+                    historical_provider.stoken_amount_before * delta / 10_000_000_000_000
+                }
+            }
+        }
+
+
+        fn register_historical_provider(&mut self, provider: &ProviderInfo, token_remain:u128, withdrawable_capital:u128, address: &AccountId){
+            let index_before = provider.index;
+            let stoken_amount_before = provider.stoken_amount;
+            let token_left = token_remain - withdrawable_capital;
+            let ftoken = token_left * 100_000 / self.exchange_rate;
+            let acc_sps_while_left = self.acc_sps;
+            let sdebt_before = provider.sdebt;
+            let historical_provider = HistoricalProviderInfo{
+                index_before, 
+                stoken_amount_before,
+                ftoken,
+                acc_sps_while_left, 
+                sdebt_before, 
+            };
+            self.token_frozen_here += token_left;
+
+            self.historical_provider_map.insert(address, &historical_provider);
+        }
+
+
+        pub fn provider_abolish(&mut self) -> Result<()> {
+            let caller = self.env().caller();
+            match self.provider_map.get(caller) {
+                None => Err(Error::NotUnderwriter),
+                Some(_v) if self.provider_leaving == true => Err(Error::ProviderLeavingInProgress),
+                Some(v) if v.stoken_amount == 0 => Err(Error::NotValidUnderwriter),
+                Some(mut v) => {
+                    self.provider_leaving = true;
+
+                    let token_remain = v.stoken_amount * self.exchange_rate / 100_000;
+                    let shadow = self.get_shadow(&v);
+
+                    let withdrawable_capital: u128;
+                    if token_remain >= shadow {
+                        withdrawable_capital = token_remain - shadow;
+                    } else{
+                        withdrawable_capital = 0;
+                    }
+
+                    let reward = v.stoken_amount * self.acc_rps / 10_000_000_000_000 - v.rdebt;
+
+                    self.register_historical_provider(&v, token_remain, withdrawable_capital, &caller);
+
+                    self.stoken_supply -= v.stoken_amount;
+                    v.stoken_amount = 0;
+                    v.rdebt = 0;
+
+                    let pre_useable_capital = self.get_useable_capital().clone();
+                    self.token_staked_here -= token_remain;
+                    let current_useable_capital = self.get_useable_capital();
+                    self.update_k_last_by_provider(pre_useable_capital, current_useable_capital);
+
+                    //         //按照合约安全的原则，最后再进行支付
+                    // if (withdrawableCapital.add(reward) > 0) {
+                    //         aUSD.transfer(msg.sender, withdrawableCapital.add(reward)); //如果有钱可提，先令其提走
+                    // }
+                    self.provider_leaving = false;
+                    Ok(())
+                }
+            }
+        }
+
+
+        pub fn get_unfrozen_capital(&self) -> u128 {
+            let caller = self.env().caller();
+            if let Some(v) = self.historical_provider_map.get(caller) {
+                let shadow = self.get_shadow_historical_provider(&v);
+                if v.ftoken * self.exchange_rate / 100_000 <= shadow {
+                    return 0;
+                }else{
+                    return v.ftoken * self.exchange_rate / 100_000 - shadow;
+                }
+            };
+
+            match self.provider_map.get(caller) {
+                None => return 0,
+                Some(v) => {
+                    let token_remain = v.stoken_amount * self.exchange_rate / 100_000;
+                    if v.index > self.latest_unfrozen_index {
+                        let shadow = v.stoken_amount * self.acc_sps / 10_000_000_000_000 - v.sdebt;
+                        if token_remain >= shadow {
+                            return token_remain - shadow;
+                        }else{
+                            return 0;
+                        }
+                    }else{
+                        let delta = self.acc_sps - self.acc_sps_down;
+                        let shadow = v.stoken_amount * delta / 10_000_000_000_000;
+                        if token_remain >= shadow {
+                            return token_remain - shadow;
+                        }else{
+                            return 0;
+                        }
+                    }
+                }
+            }
+        }
+
+
+        pub fn historical_provider_withdraw(&mut self) -> Result<()>{
+            let caller = self.env().caller();
+            match self.historical_provider_map.get(&caller){
+                None => return Err(Error::NotHistoricalUnderwriter),
+                Some(_v) if self.historical_provider_leaving == true => return Err(Error::HistoricalProviderLeavingInProgress),
+                Some(mut v) => {
+                    self.historical_provider_leaving = true;
+
+                    let shadow = self.get_shadow_historical_provider(&v);
+                    
+                    if v.ftoken * self.exchange_rate / 100_000 <= shadow {
+                        return Err(Error::InsufficientSToken);
+                    }else {
+                        // aUSD.transfer(msg.sender, historicalProvider.faUSD.mul(exchangeRate).div(1e5).sub(shadow)); //支付      
+                        self.token_frozen_here -= v.ftoken * self.exchange_rate / 100_000 - shadow;
+                        v.ftoken = shadow * 100_000 / self.exchange_rate;
+                        self.historical_provider_leaving = false;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+
+        pub fn try_policy_cancel(&mut self, id: u128) -> Result<()> {
+            match self.policies.get(id) {
+                None => return Err(Error::NotExistedPolicy),
+                Some(v) if v.is_canceled == true =>  return Err(Error::AlreadyCancelledPolicy),
+                Some(mut v) => {
+                    if id == 0 {
+                        self.execute_cancel(&mut v);
+                        return Ok(());
+                    }else{
+                        match self.policies.get(id -1) {
+                            None => return Err(Error::NotExistedPolicy),
+                            Some(p) if p.is_canceled == false => return Err(Error::PreviousPolicyNotCancelled),
+                            Some(_p) => {
+                                self.execute_cancel(&mut v);
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        fn do_policy_cancel(&mut self, policy: &mut PolicyInfo, caller: &AccountId){
+            self.total_coverage -= policy.coverage;
+            self.acc_sps_down += policy.delta_acc_sps;
+            policy.is_canceled = true;
+            self.latest_unfrozen_index = policy.latest_provider_index;
+            self.update_k_last_by_cancel(self.total_coverage);
+            // aUSD.transfer(_caller, policy.deposit); //取回投保时缴纳的押金
+
+        }
+
+
+        fn update_k_last_by_cancel(&mut self, total_coverage: u128){
+            if self.token_staked_here > total_coverage {
+                let useable_capital = self.token_staked_here - total_coverage;
+                let tentative_fee = self.k_last / (useable_capital + self.virtual_param);
+                if tentative_fee >= self.min_fee {
+                    ()
+                }else{
+                    self.k_last = self.min_fee * (useable_capital + self.virtual_param);
+                }
+            }else{
+                ()
+            }
+        }
+
+        fn execute_cancel(&mut self, policy: &mut PolicyInfo) -> Result<()> {
+            let today = self.env().block_timestamp();
+            if policy.effective_until > today {
+                return Err(Error::NotExpiredPolicy);
+            } else if policy.in_claim_applying == true {
+                return Err(Error::ClaimingInProgress);
+            } else{
+                let time_pass = today - policy.effective_until;
+                if time_pass <= 86_400_000 {
+                    let caller = self.env().caller();
+                    if caller != policy.beneficiary {
+                        return Err(Error::OnlyPolicyHolderCanCancel);
+                    }else{
+                        self.do_policy_cancel(policy, &caller);
+                        return Ok(());
+                    }
+                } else{
+                        let caller = self.env().caller();
+                        self.do_policy_cancel(policy, &caller);
+                        return Ok(());
+                }
+            }
+        }
+
+        pub fn policy_claim_apply(&mut self, id: u128) -> Result<()> {
+            let caller = self.env().caller();
+            let today = self.env().block_timestamp();
+            match self.policies.get(id) {
+                None => return Err(Error::NotExistedPolicy),
+                Some(p) if p.beneficiary != caller => return Err(Error::NotBeneficiary),
+                Some(p) if p.is_claimed == true => return Err(Error::AlreadyClaimedPolicy),
+                Some(p) if p.in_claim_applying == true => return Err(Error::InClaimingProgress),
+                Some(p) if p.is_canceled == true => return Err(Error:: AlreadyCancelledPolicy),
+                Some(p) if today > p.effective_until => return Err(Error::NotEffectivePolicy),
+                Some(mut p) => {
+                    p.in_claim_applying = true;
+                    return Ok(());
+                }
+            }
+        }
+        
+        pub fn refuse_apply(&mut self, id: u128) -> Result<()> {
+            let caller = self.env().caller();
+            if caller != self.judger {
+                return Err(Error::NotJudger);
+            }else{
+                match self.policies.get(id) {
+                    None => return Err(Error::NotExistedPolicy),
+                    Some(mut p) => {
+                        p.in_claim_applying = false;
+                        return Ok(());
+                    }
+                }
+            }
+        }
+
+        pub fn accept_apply(&self, id: u128) -> Result<()> {
+            let caller = self.env().caller();
+            if caller != self.judger {
+                return Err(Error::NotJudger);
+            }else{
+                match self.policies.get(id) {
+                    None => return Err(Error::NotExistedPolicy),
+                    Some(p) if p.in_claim_applying == false => return Err(Error::NotInClaimingProgress),
+                    Some(mut p) => {
+                        p.in_claim_applying = false;
+                        p.is_claimed = true;
+
+                        return Ok(());
+                        
+                // //判断情况，实施理赔
+                // if (aUSD.balanceOf(address(riskReserve)) >= policy.coverage) {
+                //     //理赔池够赔的情况
+                //     aUSD.transferFrom(
+                //         address(riskReserve),
+                //         policy.beneficiary,
+                //         policy.coverage
+                //     ); //实施理赔
+                // } else {
+                //     //理赔池不够赔的情况
+                //     aUSD.transferFrom(
+                //         address(riskReserve),
+                //         policy.beneficiary,
+                //         aUSD.balanceOf(address(riskReserve))
+                //     ); //理赔池先耗尽
+                //     uint256 exceeded = policy.coverage.sub(
+                //         aUSD.balanceOf(address(riskReserve))
+                //     );
+                //     _exceededPay(policy.beneficiary, exceeded); //多出部分，资本池赔付
+                // }
+
+                    }
+                }
+            }
+        }
+
+        fn exceeded_pay(&mut self, to: AccountId, exceeded: u128) {
+            let pre_reserve = self.token_staked_here + self.token_frozen_here;
+            let after_reserve = pre_reserve - exceeded;
+
+            let delta_rate = after_reserve * 100_000 / pre_reserve;
+
+            self.exchange_rate = self.exchange_rate * delta_rate / 100_000;
+
+            self.token_staked_here = self.token_staked_here * delta_rate / 100_000;
+
+            self.token_frozen_here = self.token_frozen_here * delta_rate / 100_000;
+
+            // aUSD.transfer(_to, _exceeded); //执行第一步
+        }
+
+        pub fn unused_capital_for_mining(&self, amount: u128, to: AccountId) -> Result<()> {
+            let caller = self.env().caller();
+            if caller != self.judger {
+                return Err(Error::NotJudger);
+            }else {
+                match self.is_valid_mining_proxy.get(to) {
+                    None => return Err(Error::NotValidMiningProxy),
+                    Some(v) if v == false => return Err(Error::NotValidMiningProxy),
+                    Some(_v) => {
+                        // aUSD.transfer(_to, _amount); //闲置资本转移到挖矿代理合约之后，挖矿通过代理合约执行，挖矿收益的领取也在代理合约执行
+                        return Ok(());
+                    }
+                }
+            }
+            
+        }
+
+
     }
 }
