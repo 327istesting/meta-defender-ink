@@ -1024,7 +1024,7 @@ mod meta_defender {
             );
 
             let md_acc_id = client
-                .instantiate("meta_defender", &mut ink_e2e::alice(), constructor, 0, None)
+                .instantiate("meta_defender", &mut ink_e2e::alice(), md_constructor, 0, None)
                 .await
                 .expect("instantiate failed")
                 .account_id;
